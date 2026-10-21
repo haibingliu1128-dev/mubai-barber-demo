@@ -1,0 +1,133 @@
+'use strict';
+// 商家后台业务：看板、预约列表、顾客/黑名单、防占号设置、服务管理、审计
+const U = require('../lib/util');
+const Rules = require('./rules');
+const Perm = require('./perms');
+const IND = require('../industry');
+// 评价与反馈相关开关：始终仅店主可改（不能授权给店员）
+const OWNER_KEYS = new Set(['review', 'reply', 'reviewPublic', 'feedback', 'contact']);
+const { AppError, today, toHm } = U;
+
+function createMerchantService(ctx, B) {
+  const { repo, bus } = ctx;
+  const audit = (user, action, target, detail, ip) => repo.audit({ actor_type: 'merchant', actor_id: user.id, actor_name: user.username, action, target, detail, ip });
+  const owner = user => { if (user.role !== 'owner') throw new AppError(403, 'OWNER_ONLY', '仅店主账号可修改该设置'); };
+
+  function dashboard() {
+    const t = today(), [a, b] = U.weekRange(t), s = repo.stats(t, a, b);
+    const days = []; for (let i = 0; i < 7; i++) { const d = U.ymd(U.addDays(U.parseYmd(a), i)); const r = s.week.find(x => x.date === d); days.push({ date: d, amount: r ? r.s / 100 : 0 }); }
+    return { today: s.today, pending: s.pending, upcoming: s.upcoming, noshow30: s.noshow30, blacklisted: s.blacklisted, week: days };
+  }
+  function bookings(scope, date, user) {
+    const t = today();
+    let rows;
+    if (scope === 'today') rows = repo.listBookings({ from: date || t, to: date || t });
+    else if (scope === 'pending') rows = repo.listBookings({ from: U.ymd(U.addDays(new Date(), -1)), statuses: ['pending', 'awaiting_payment'] });
+    else if (scope === 'upcoming') rows = repo.listBookings({ from: t, statuses: ['pending', 'confirmed', 'arrived', 'awaiting_payment'] });
+    else rows = repo.listBookings({ limit: 200 });
+    return rows.map(b => B.dto(b, { merchant: true, user }));
+  }
+  function customers(q, user) {
+    const C = B.settings(), full = Perm.can(user, 'customer.phone');
+    q = q && String(q).trim();
+    let rows = repo.listCustomers(q);
+    // 未授权完整手机号：数字搜索只能匹配打码后可见的部分（前 3 / 后 4 位）或完整号码，防止用中间位反推号码
+    if (!full && q && /\d/.test(q)) rows = rows.filter(c => (c.name && c.name.includes(q)) || c.phone === q || U.maskPhone(c.phone).includes(q));
+    return rows.map(c => {
+      const r = B.restriction(C, c);
+      return { id: c.id, phone: full ? c.phone : U.maskPhone(c.phone), phoneMasked: !full, name: c.name, blacklisted: !!c.blacklisted, blackReason: c.black_reason, total: c.total, noshowTotal: c.noshow_total,
+        noshowInWindow: r.count, restricted: r.restricted ? { act: r.act, until: r.until } : null, verified: !!c.verified_at,
+        rateLockedUntil: c.rate_lock_until > Date.now() ? c.rate_lock_until : null };
+    });
+  }
+  /** 按顾客 ID 或完整手机号定位（店员看到的是打码号码，界面用 ID 操作） */
+  function findCustomer(key) {
+    key = String(key == null ? '' : key).trim();
+    if (U.isPhone(key)) return repo.getCustomerByPhone(key);
+    if (/^\d{1,9}$/.test(key)) return repo.getCustomer(+key);
+    return null;
+  }
+  function setBlacklist(user, b, ip) {
+    Perm.need(user, 'customer.blacklist');
+    const on = b.on !== false, reason = b.reason;
+    let c;
+    if (b.customerId != null) { c = findCustomer(String(b.customerId)); if (!c) throw new AppError(404, 'NOT_FOUND', '顾客不存在'); }
+    else { const phone = String(b.phone || ''); if (!U.isPhone(phone)) throw new AppError(400, 'BAD_PHONE', '请输入正确的 11 位手机号'); c = repo.ensureCustomer(phone); }
+    const phone = c.phone;
+    repo.updateCustomer(c.id, { blacklisted: on ? 1 : 0, black_reason: on ? String(reason || '').slice(0, 40) || null : null });
+    audit(user, on ? 'customer.blacklist' : 'customer.unblacklist', 'customer:' + phone, { reason }, ip);
+    bus.emit('change', { type: 'customer' });
+    return { customerId: c.id, phone: Perm.phoneFor(user, phone), blacklisted: !!on };
+  }
+  function clearRestriction(user, key, ip) {
+    Perm.need(user, 'customer.blacklist');
+    const c = findCustomer(key); if (!c) throw new AppError(404, 'NOT_FOUND', '顾客不存在');
+    const phone = c.phone;
+    repo.updateCustomer(c.id, { restrict_cleared_at: Date.now(), rate_lock_until: null });
+    audit(user, 'customer.clear_restriction', 'customer:' + phone, null, ip);
+    bus.emit('change', { type: 'customer' });
+    return { ok: true };
+  }
+  function getSettings() {
+    const shop = repo.getShop();
+    return { shop: { phone: shop.phone, address: shop.address }, lists: Rules.LISTS, values: B.settings(), schema: Rules.SCHEMA, ranges: Rules.RANGES, depositRange: Rules.DEP_RANGE, defaults: Rules.DEFAULTS,
+      services: repo.listServices(true).filter(s => s.active).map(s => ({ id: s.id, name: s.name, depositOn: !!s.deposit_on, deposit: s.deposit_cents / 100 })) };
+  }
+  function updateSettings(user, patch, ip) {
+    const keys = Object.keys(patch || {});
+    if (keys.some(k => OWNER_KEYS.has(k))) Perm.ownerOnly(user, '修改评价与反馈功能开关');
+    else Perm.need(user, 'rules.edit');
+    const cur = B.settings();
+    let nv; try { nv = Rules.validatePatch(cur, patch); } catch (e) { throw new AppError(400, 'BAD_SETTING', e.msg, { path: e.path }); }
+    repo.tx(() => { for (const [k, v] of Object.entries(nv)) repo.putSetting(k, v); });
+    audit(user, 'settings.update', 'settings', nv, ip);
+    bus.emit('change', { type: 'settings' });
+    return getSettings();
+  }
+  function resetSettings(user, ip) {
+    owner(user); repo.clearSettings(); audit(user, 'settings.reset', 'settings', null, ip); bus.emit('change', { type: 'settings' }); return getSettings();
+  }
+  function cleanService(b, partial, id0) {
+    const f = {};
+    const need = k => !partial || b[k] !== undefined;
+    if (need('name')) { const n = String(b.name || '').trim(); if (!n || n.length > 14) throw new AppError(400, 'BAD_INPUT', '服务名称 1–14 字'); f.name = n; }
+    if (need('desc')) f.descr = String(b.desc || '').trim().slice(0, 24);
+    if (need('price')) { const p = Number(b.price); if (!(p >= 0 && p <= 99999)) throw new AppError(400, 'BAD_INPUT', '价格须在 0–99999 元'); f.price_cents = Math.round(p * 100); }
+    if (need('duration')) { const d = Number(b.duration); if (!(IND.durations || [30, 45, 60, 90, 120, 150, 180]).includes(d)) throw new AppError(400, 'BAD_INPUT', '时长不合法'); f.duration_min = d; }
+    if (b.pricing !== undefined) { if (!IND.validatePricing) throw new AppError(400, 'BAD_INPUT', '不支持分级价格'); const pr = IND.validatePricing(b.pricing, partial && id0 ? repo.getService(+id0) : null); f.pricing = JSON.stringify(pr);
+      if (IND.pricingBase) { const m = IND.pricingBase(pr); if (m.price != null) f.price_cents = Math.round(m.price * 100); if (m.duration) f.duration_min = m.duration; } }
+    if (b.kind !== undefined && IND.serviceKinds) { if (!IND.serviceKinds.includes(b.kind)) throw new AppError(400, 'BAD_INPUT', '服务类型不正确'); f.kind = b.kind; }
+    if (b.icon !== undefined) f.icon = String(b.icon).slice(0, 12);
+    if (b.color !== undefined) f.color = Math.max(0, Math.min(5, +b.color || 0));
+    if (b.images !== undefined) f.images = JSON.stringify(ctx.images.checkIds(b.images, 3, '服务图片'));
+    if (b.depositOn !== undefined) f.deposit_on = b.depositOn ? 1 : 0;
+    if (b.deposit !== undefined) {
+      const [mn, mx, st] = Rules.DEP_RANGE, v = Number(b.deposit);
+      if (!Number.isInteger(v) || v < mn || v > mx || (v - mn) % st) throw new AppError(400, 'BAD_SETTING', `定金须在 ${mn}–${mx} 元之间，且为 ${st} 的倍数`, { path: 'dep' });
+      f.deposit_cents = v * 100;
+    }
+    return f;
+  }
+  function saveService(user, id, body, ip) {
+    Perm.need(user, 'service.manage');
+    if (id) {
+      const s = repo.getService(+id); if (!s || !s.active) throw new AppError(404, 'NOT_FOUND', '服务不存在');
+      const f = cleanService(body, true, id); repo.updateService(s.id, f); audit(user, 'service.update', 'service:' + s.id, f, ip);
+    } else {
+      const f = cleanService(body, false);
+      id = repo.insertService({ icon: IND.defaultIcon || 'polish', color: 0, hot: 0, sort: 99, deposit_on: 0, deposit_cents: 3000, ...f });
+      audit(user, 'service.create', 'service:' + id, f, ip);
+    }
+    bus.emit('change', { type: 'service' });
+    return B.svcDto(repo.getService(+id), B.settings());
+  }
+  function deleteService(user, id, ip) {
+    Perm.need(user, 'service.manage'); repo.updateService(+id, { active: 0 }); audit(user, 'service.delete', 'service:' + id, null, ip); bus.emit('change', { type: 'service' }); return { ok: true };
+  }
+  function noShows(user) { return repo.recentNoShows(20).map(b => B.dto(b, { merchant: true, user })); }
+  function auditLog(user) { Perm.ownerOnly(user, '查看操作日志'); const us = new Map(repo.listMerchants().map(u => [u.id, u]));
+    return repo.listAudit(150).map(a => { const u = a.actor_type === 'merchant' && a.actor_id ? us.get(a.actor_id) : null;
+      return { ...a, actorDisplay: u ? u.display_name : null, actorRole: u ? u.role : null, detail: a.detail ? JSON.parse(a.detail) : null }; }); }
+  return { dashboard, bookings, customers, setBlacklist, clearRestriction, getSettings, updateSettings, resetSettings, saveService, deleteService, noShows, auditLog };
+}
+module.exports = { createMerchantService };

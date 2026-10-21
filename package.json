@@ -1,0 +1,27 @@
+{
+  "name": "mubai-barber-demo",
+  "version": "1.0.0",
+  "description": "木白理发工作室（示例门店）在线预约 · 全栈演示",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test test/*.test.js",
+    "e2e": "bash scripts/e2e.sh",
+    "backup": "bash scripts/backup.sh"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@fastify/static": "^10.1.6",
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "12.9.0",
+    "fastify": "^5.12.7"
+  },
+  "private": true,
+  "engines": {
+    "node": "20.x"
+  }
+}
